@@ -88,7 +88,7 @@ SOURCE_RETRY_DELAY: float = float(os.environ.get("SOURCE_RETRY_DELAY", "3.0"))
 # ════════════════════════════════════════════════════════════════
 #   S T O R A G E  P A T H S
 # ════════════════════════════════════════════════════════════════
-DATA_DIR: Path   = Path(os.environ.get("DATA_DIR", "/var/lib/subhunter"))
+DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "/app/data"))
 RESUME_DIR: Path = DATA_DIR / "resume_data"
 USERS_FILE: Path = DATA_DIR / "users.json"
 LOG_FILE: str    = os.environ.get("LOG_FILE", str(DATA_DIR / "subhunter.log"))
