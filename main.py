@@ -1,11 +1,49 @@
-#!/usr/bin/env python3
 """
-SubHunter Bot — main.py
-Entry point: builds the Application, registers all handlers, starts polling.
+SubHunter Bot v5.0 — Entry Point
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Startup, handler registration, health server, graceful shutdown.
+
+Fixes in v5.0:
+  - post_shutdown registered via .builder() not direct assignment
+  - CallbackQueryHandler group fixed (inline buttons work correctly)
+  - Force join callback registered globally
+  - PTB 22.7 compatible
+
+Run:
+  python main.py
 """
 
-import warnings
-from telegram.warnings import PTBUserWarning
+import asyncio
+import logging
+import signal
+import sys
+import os
+from threading import Thread
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+import config
+
+# ── Logging setup ─────────────────────────────────────────────
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
+    ],
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
+log = logging.getLogger("SubHunter.Main")
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,122 +53,185 @@ from telegram.ext import (
     filters,
 )
 
-warnings.filterwarnings(
-    "ignore",
-    message=r".*per_message=False.*CallbackQueryHandler.*",
-    category=PTBUserWarning,
-)
-
-from bot.logger import log  # noqa: E402 — must be first
-
-from bot.config import (
-    BOT_TOKEN,
-    DOMAIN_WORKERS, CHUNK_SIZE, SOURCE_TIMEOUT,
-    RESUME_DIR, USERS_FILE, LOG_FILE, LOG_CHANNEL_ID, ADMIN_IDS,
+from config import (
+    BOT_TOKEN, VERSION,
     CHOOSING_MODE, WAITING_DOMAIN, WAITING_FILE,
     ADMIN_BROADCAST, ADMIN_BAN_INPUT, ADMIN_UNBAN_INPUT,
+    ENABLE_HEALTH_SERVER, HEALTH_PORT,
 )
 
-from bot.handlers.start import (
-    cmd_start, cmd_scan, cmd_help, cmd_about, cmd_fallback, button_handler,
-)
-from bot.handlers.scan import (
-    cmd_cancel, cmd_resume, cmd_status, cmd_getfinal,
+from handlers import (
+    cmd_start, cmd_help, cmd_about, cmd_status, cmd_cancel,
+    cmd_scan, cmd_file, cmd_resume,
     handle_domain_input, handle_file_input,
+    handle_text, button_handler,
 )
-from bot.handlers.admin import (
-    cmd_admin, cmd_ban, cmd_unban, cmd_broadcast,
-    handle_admin_broadcast, handle_admin_ban_input, handle_admin_unban_input,
+from admin import (
+    cmd_admin, admin_callback,
+    handle_broadcast_input, handle_ban_input, handle_unban_input,
 )
+from scanner import close_session
 
 
-def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+# ════════════════════════════════════════════════════════════════
+#   H E A L T H  S E R V E R
+# ════════════════════════════════════════════════════════════════
 
+def start_health_server() -> None:
+    if not ENABLE_HEALTH_SERVER:
+        return
+
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"status":"ok","bot":"SubHunter","version":"' + VERSION.encode() + b'"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    def _serve():
+        try:
+            server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+            log.info(f"[Health] Server listening on :{HEALTH_PORT}/health")
+            server.serve_forever()
+        except OSError as e:
+            log.warning(f"[Health] Could not start health server: {e}")
+
+    t = Thread(target=_serve, daemon=True, name="health-server")
+    t.start()
+
+
+# ════════════════════════════════════════════════════════════════
+#   H A N D L E R  R E G I S T R A T I O N
+# ════════════════════════════════════════════════════════════════
+
+def build_application() -> Application:
+    # FIX: post_shutdown registered via builder, NOT direct assignment
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # ── ConversationHandler (group 0) ────────────────────────
     conv = ConversationHandler(
         entry_points=[
-            CommandHandler("start", cmd_start),
-            CommandHandler("scan",  cmd_scan),
+            CommandHandler("start",  cmd_start),
+            CommandHandler("scan",   cmd_scan),
+            CommandHandler("file",   cmd_file),
+            CommandHandler("resume", cmd_resume),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
         ],
         states={
             CHOOSING_MODE: [
-                CallbackQueryHandler(button_handler),
+                CommandHandler("scan",   cmd_scan),
+                CommandHandler("file",   cmd_file),
+                CommandHandler("resume", cmd_resume),
+                CommandHandler("status", cmd_status),
+                CommandHandler("help",   cmd_help),
+                CommandHandler("about",  cmd_about),
+                CommandHandler("admin",  cmd_admin),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
             ],
             WAITING_DOMAIN: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_domain_input),
-                CallbackQueryHandler(button_handler),
+                CommandHandler("cancel", cmd_cancel),
             ],
             WAITING_FILE: [
                 MessageHandler(filters.Document.ALL, handle_file_input),
-                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_input),
+                CommandHandler("cancel", cmd_cancel),
             ],
             ADMIN_BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_broadcast),
-                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_input),
+                CommandHandler("cancel", cmd_cancel),
             ],
             ADMIN_BAN_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_ban_input),
-                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ban_input),
+                CommandHandler("cancel", cmd_cancel),
             ],
             ADMIN_UNBAN_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_unban_input),
-                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unban_input),
+                CommandHandler("cancel", cmd_cancel),
             ],
         },
         fallbacks=[
-            CommandHandler("start",     cmd_start),
-            CommandHandler("scan",      cmd_scan),
-            CommandHandler("cancel",    cmd_cancel),
-            CommandHandler("resume",    cmd_resume),
-            CommandHandler("status",    cmd_status),
-            CommandHandler("getfinal",  cmd_getfinal),
-            CommandHandler("help",      cmd_help),
-            CommandHandler("about",     cmd_about),
-            CommandHandler("admin",     cmd_admin),
-            CommandHandler("ban",       cmd_ban),
-            CommandHandler("unban",     cmd_unban),
-            CommandHandler("broadcast", cmd_broadcast),
-            MessageHandler(filters.ALL, cmd_fallback),
+            CommandHandler("start",  cmd_start),
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler("status", cmd_status),
+            CommandHandler("help",   cmd_help),
+            CommandHandler("about",  cmd_about),
+            CommandHandler("admin",  cmd_admin),
         ],
         allow_reentry=True,
+        name="main_conv",
+        persistent=False,
     )
-    app.add_handler(conv)
 
-    # Global commands (work outside conversation too)
-    for cmd, fn in [
-        ("cancel",    cmd_cancel),
-        ("resume",    cmd_resume),
-        ("status",    cmd_status),
-        ("getfinal",  cmd_getfinal),
-        ("help",      cmd_help),
-        ("about",     cmd_about),
-        ("admin",     cmd_admin),
-        ("ban",       cmd_ban),
-        ("unban",     cmd_unban),
-        ("broadcast", cmd_broadcast),
-    ]:
-        app.add_handler(CommandHandler(cmd, fn))
+    app.add_handler(conv, group=0)
+
+    # ── FIX: Global CallbackQueryHandler in group 1 ──────────
+    # Handles ALL inline button presses (force_join_check, adm_* buttons).
+    # group=1 means it runs after ConversationHandler but still processes
+    # callback_query updates correctly.
+    # The button_handler function correctly returns CHOOSING_MODE which
+    # is informational only outside a conversation — no state breakage.
+    app.add_handler(CallbackQueryHandler(button_handler), group=1)
+
+    # ── Standalone commands outside conversation ─────────────
+    app.add_handler(CommandHandler("help",  cmd_help),  group=2)
+    app.add_handler(CommandHandler("about", cmd_about), group=2)
+    app.add_handler(CommandHandler("admin", cmd_admin), group=2)
 
     return app
 
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set. Export it as an environment variable.")
+# ════════════════════════════════════════════════════════════════
+#   S H U T D O W N  H O O K S
+# ════════════════════════════════════════════════════════════════
 
-    log.info("SubHunter Bot starting…")
-    log.info(f"  ADMIN_IDS      : {ADMIN_IDS}")
-    log.info(f"  LOG_CHANNEL    : {LOG_CHANNEL_ID}")
-    log.info(f"  DOMAIN_WORKERS : {DOMAIN_WORKERS}")
-    log.info(f"  CHUNK_SIZE     : {CHUNK_SIZE}")
-    log.info(f"  SOURCE_TIMEOUT : {SOURCE_TIMEOUT}s")
-    log.info(f"  RESUME_DIR     : {RESUME_DIR}")
-    log.info(f"  USERS_FILE     : {USERS_FILE}")
-    log.info(f"  LOG_FILE       : {LOG_FILE}")
+async def post_shutdown(app: Application) -> None:
+    """Clean up shared resources on shutdown."""
+    await close_session()
+    log.info("[Main] Shared aiohttp session closed.")
 
-    app = build_app()
-    log.info("Bot is live — polling started. Ctrl+C to stop.")
-    app.run_polling(drop_pending_updates=True)
+
+# ════════════════════════════════════════════════════════════════
+#   M A I N
+# ════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    log.info(f"╔══════════════════════════════════════╗")
+    log.info(f"║  SubHunter Bot v{VERSION:<21} ║")
+    log.info(f"║  Data dir: {str(config.DATA_DIR):<25} ║")
+    log.info(f"║  Admin IDs: {str(config.ADMIN_IDS):<24} ║")
+    if config.FORCE_JOIN_CHANNELS:
+        log.info(f"║  Force Join: {str(config.FORCE_JOIN_CHANNELS):<22} ║")
+    log.info(f"╚══════════════════════════════════════╝")
+
+    start_health_server()
+
+    app = build_application()
+
+    def handle_sigterm(signum, frame):
+        log.info("[Main] SIGTERM received — shutting down gracefully…")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    log.info("[Main] Starting polling…")
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":

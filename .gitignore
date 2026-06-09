@@ -1,0 +1,25 @@
+# ── Secrets (NEVER commit these) ─────────────────────
+.env
+*.env
+
+# ── Runtime data (VPS-local) ──────────────────────────
+/var/lib/subhunter/
+resume_data/
+users.json
+users.json.bak
+*.log
+
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# ── OS ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

@@ -1,0 +1,64 @@
+# ══════════════════════════════════════════════════════════════
+#  SubHunter Bot — systemd service
+#
+#  INSTALL:
+#    sudo cp subhunter.service /etc/systemd/system/
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable subhunter
+#    sudo systemctl start subhunter
+#
+#  MANAGE:
+#    sudo systemctl status subhunter     — check status
+#    sudo systemctl restart subhunter    — restart bot
+#    sudo systemctl stop subhunter       — stop bot
+#    sudo journalctl -u subhunter -f     — live logs
+#    sudo journalctl -u subhunter -n 100 — last 100 lines
+# ══════════════════════════════════════════════════════════════
+
+[Unit]
+Description=SubHunter Telegram Bot v4.0
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# ── Change these to match your setup ──────────────────────────
+User=subhunter
+Group=subhunter
+WorkingDirectory=/opt/subhunter
+
+# Python virtual environment executable
+ExecStart=/opt/subhunter/venv/bin/python main.py
+
+# ── Environment ───────────────────────────────────────────────
+# Load .env file for environment variables
+EnvironmentFile=/opt/subhunter/.env
+
+# ── Restart policy ────────────────────────────────────────────
+Restart=on-failure
+RestartSec=10s
+# After 5 crashes in 120s, systemd will stop trying
+# (prevents crash loops from filling logs)
+
+# ── Security hardening ────────────────────────────────────────
+# Protect the rest of the system from the bot process
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/subhunter /var/lib/subhunter
+
+# ── Resource limits (1GB RAM VPS) ─────────────────────────────
+# Prevent the bot from consuming all memory
+MemoryMax=512M
+CPUQuota=80%
+
+# ── Logging ───────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=subhunter
+
+[Install]
+WantedBy=multi-user.target
